@@ -45,6 +45,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <dirent.h>
 #include <regex.h>
 #include <wordexp.h>
+#include <grp.h>
 #if HAVE_SYS_SELECT_H
 #  include <sys/select.h>
 #endif
@@ -98,12 +99,13 @@ void endusershell(void);
  * @return if this was successful
  */
 bool readConfigFile(void);
+void setupuidandgid(char* username);
 void logSession(const int);
 void execShell(const char *, const char *);
 char *setupusername(void);
 char *setupshell(void);
 int setupusermode(void);
-void finish(void);
+void finish(bool);
 char* consume_remaining_args(int, char **, char *);
 int beginlogging(const char *);
 void dologging(char *, int);
@@ -200,7 +202,8 @@ static dev_t logDev;
 static char logFileName[MAXPATHLEN - 9];
 static char *userLogFileName;
 static char *userLogFileDir;
-
+static uid_t userUid;
+static gid_t userGid;
 #ifndef LOGTOFILE
 static bool logtofile = false;
 #else
@@ -259,6 +262,9 @@ volatile sig_atomic_t sigWinchReceived = 0;
 volatile sig_atomic_t sigIntReceived = 0;
 volatile sig_atomic_t sigQuitReceived = 0;
 volatile sig_atomic_t sigChldReceived = 0;
+volatile sig_atomic_t sigHupReceived = 0;
+volatile sig_atomic_t sigTermReceived = 0;
+static int childPid;
 
 void signalHandler(int const signal) {
   if(signal == SIGINT) {
@@ -269,6 +275,12 @@ void signalHandler(int const signal) {
   }
   else if(signal == SIGCHLD) {
     sigChldReceived = 1;
+  }
+  else if(signal == SIGHUP) {
+    sigHupReceived = 1;
+  }
+  else if(signal == SIGTERM) {
+    sigTermReceived = 1;
   }
   else if(signal == SIGWINCH) {
     sigWinchReceived = 1;
@@ -293,7 +305,6 @@ int main(int argc, char **argv) {
   //
   //  long_options	Used by getopt_long.
   */
-  int childPid;
   char *shell, *shellCommands = NULL;
   static char sessionIdEnv[sizeof(sessionId) + 17];
   int c, option_index = 0;
@@ -457,22 +468,30 @@ void setupSignalHandlers(void) {
   sigaction(SIGQUIT, &action, NULL);
   sigaction(SIGCHLD, &action, NULL);
   sigaction(SIGWINCH, &action, NULL);
+  sigaction(SIGHUP, &action, NULL);
+  sigaction(SIGTERM, &action, NULL);
 #elif HAVE_SIGSET
   sigset(SIGINT, signalHandler);
   sigset(SIGQUIT, signalHandler);
   sigset(SIGCHLD, signalHandler);
   sigset(SIGWINCH, signalHandler);
+  sigset(SIGHUP, signalHandler);
+  sigset(SIGTERM, signalHandler);
 #else
   signal(SIGINT, signalHandler);
   signal(SIGQUIT, signalHandler);
   signal(SIGCHLD, signalHandler);
   signal(SIGWINCH, signalHandler);
+  signal(SIGHUP, signalHandler);
+  signal(SIGTERM, signalHandler);
 #endif
 
   sigWinchReceived = 0;
   sigIntReceived = 0;
   sigQuitReceived = 0;
   sigChldReceived = 0;
+  sigHupReceived = 0;
+  sigTermReceived = 0;
 }
 
 void logSession(const int childPid) {
@@ -614,12 +633,14 @@ void logSession(const int childPid) {
       sigWinchReceived = 0;
     }
 
-    if(sigIntReceived || sigQuitReceived || sigChldReceived) {
-      finish();
+    if(sigIntReceived || sigQuitReceived || sigChldReceived || sigHupReceived || sigTermReceived) {
+      finish(true);
 
       sigIntReceived = 0;
       sigQuitReceived = 0;
       sigChldReceived = 0;
+      sigHupReceived = 0;
+      sigTermReceived = 0;
     }
     
 
@@ -646,15 +667,30 @@ void execShell(const char *shell, const char *shellCommands) {
   //
   */
   char *dashShell;
-  char *sucmd = SUCMD;
-  
-  /* 
-  //  This process will exec a shell.
-  //  If rootsh was called with the -u user parameter, we will exec
-  //  su user instead of a shell.
-  */
-  if (runAsUser) {
-    shell = sucmd;
+  int ngroups;
+  gid_t *groups;
+  /*struct passwd *pw;*/
+  ngroups = 255  ;
+  groups = malloc(ngroups * sizeof (gid_t));
+  if (groups == NULL) {
+     perror("malloc");
+     exit(EXIT_FAILURE);
+  }
+
+  /* Retrieve group list */
+  if (getgrouplist(userName, userGid, groups, &ngroups) == -1) {
+    fprintf(stderr, "getgrouplist() returned -1; ngroups = %d\n",
+      ngroups);
+    exit(EXIT_FAILURE);
+  }
+
+  if (setgroups(ngroups, groups) > 0) {
+     exit(EXIT_FAILURE);
+     return;
+  }
+  if (setgid(userGid) > 0 || setuid(userUid) > 0) {
+     exit(EXIT_FAILURE);
+     return;
   }
   /*
   //  If rootsh was called with the -i parameter (initial login)
@@ -730,7 +766,7 @@ char * consume_remaining_args(int argc, char **argv, char *shellCommands) {
 //  Restore original tty modes.
 //  Send some final words to the logging function.
 */
-void finish(void) {
+void finish(bool killChild) {
   /*
   //  msgbuf	A buffer where a variable text will be written.
   //
@@ -747,6 +783,9 @@ void finish(void) {
     if (tcsetattr(0, TCSANOW, &termParams) < 0) {
       perror("tcsetattr: stdin");
     }
+  }
+  if (killChild) {
+    kill(childPid, SIGHUP);
   }
   
   pid = wait(&status);
@@ -1172,10 +1211,38 @@ int forceopen(char *path) {
 }
 
 
+void setupuidandgid(char* username) {
+    struct passwd *pwd = calloc(1, sizeof(struct passwd));
+    size_t buffer_len;
+    char *buffer;
+    if(pwd == NULL)
+    {
+        fprintf(stderr, "Failed to allocate struct passwd for getpwnam_r.\n");
+        exit(EXIT_FAILURE);
+    }
+    buffer_len = sysconf(_SC_GETPW_R_SIZE_MAX) * sizeof(char);
+    buffer = malloc(buffer_len);
+    if(buffer == NULL)
+    {
+        fprintf(stderr, "Failed to allocate buffer for getpwnam_r.\n");
+        exit(EXIT_FAILURE);
+    }
+    getpwnam_r(username, pwd, buffer, buffer_len, &pwd);
+    if(pwd == NULL)
+    {
+        fprintf(stderr, "getpwnam_r failed to find requested entry.\n");
+        exit(EXIT_FAILURE);
+    }
+    userUid = pwd->pw_uid;
+    userGid = pwd->pw_gid;
+
+    free(pwd);
+    free(buffer);
+
+}
 /*
 //  Find out the username of the calling user.
 */
-
 char *setupusername() {
   /*
   //  userName	A pointer to allocated memory containing the username.
@@ -1186,11 +1253,9 @@ char *setupusername() {
   */
   char *userName = NULL;
   struct stat ttybuf;
-  struct passwd *passwd_entry;
     
-  passwd_entry = getpwuid(geteuid());
-  userName = passwd_entry->pw_name;
-
+      userName = getenv("SUDO_USER");
+  setupuidandgid(userName);
   if(userName == NULL) {
   /*if((userName = getlogin()) == NULL) {*/
   /*if((cuserid(userName)) == NULL) {*/
